@@ -20,12 +20,20 @@
 
 /* ---- stubs for boot_io.c / profile.c ---- */
 static BOOLEAN log_open,verbose,cold_result;
+static char CapturedLog[32768];
+static unsigned HighTplLogs;
+static int AliasLogDrift;
 static int silenced,silence_calls,unsilence_calls,cold_calls,cold_fail_on_call;
 BOOLEAN GuBootLogOpen(VOID){return log_open;}
 VOID GuBootSilence(VOID){silenced=1;silence_calls++;trace_ev(EV_SILENCE);}
 VOID GuBootUnsilence(VOID){silenced=0;unsilence_calls++;trace_ev(EV_UNSILENCE);}
 VOID GuLog(const char *f,...){
   trace_ev(EV_LOG);
+  if(Fg.tpl>(int)TPL_APPLICATION)HighTplLogs++;
+  {size_t n=strlen(CapturedLog);va_list a;va_start(a,f);vsnprintf(CapturedLog+n,sizeof CapturedLog-n,f,a);va_end(a);}
+  if((AliasLogDrift==1&&strstr(f,"preflight console GOP alias:"))||(AliasLogDrift==2&&strstr(f,"preflight GOP check:"))){
+    FgInfo[6].Version++;AliasLogDrift=0;
+  }
   if(verbose){va_list a;va_start(a,f);vfprintf(stderr,f,a);va_end(a);}
 }
 VOID GuLogText(const char *t){trace_ev(EV_LOG);if(verbose)fputs(t,stderr);}
@@ -47,6 +55,8 @@ static void begin(const char *name){
   Name=name;Scenarios++;
   fg_defaults();pc_init();fg_build();memset(&Plan,0,sizeof(Plan));
   log_open=TRUE;silenced=0;silence_calls=unsilence_calls=0;cold_calls=0;cold_fail_on_call=0;cold_result=TRUE;
+  CapturedLog[0]=0;HighTplLogs=0;
+  AliasLogDrift=0;
   gu_setup();
 }
 /* Change the topology after begin() (config switches in Fg.cfg). */
@@ -650,8 +660,249 @@ static void s_ready_preconditions(void){
   FgSt.ConIn=NULL;CHECK(!GuRelReadyForWindows(FALSE));
 }
 
+static EFI_STATUS EFIAPI console_changed_buffer(EFI_LOCATE_SEARCH_TYPE t,EFI_GUID *g,VOID *key,UINTN *n,EFI_HANDLE **buf){
+  EFI_STATUS s=bs_locate_buffer(t,g,key,n,buf);FgSt.ConOut=&FgOutOther;return s;
+}
+static EFI_STATUS EFIAPI failed_gop_buffer(EFI_LOCATE_SEARCH_TYPE t,EFI_GUID *g,VOID *key,UINTN *n,EFI_HANDLE **buf){
+  (void)t;(void)g;(void)key;*n=0;*buf=NULL;return EFI_DEVICE_ERROR;
+}
+static EFI_STATUS EFIAPI failed_console_gop(EFI_HANDLE handle,EFI_GUID *guid,VOID **iface){
+  if(handle==H(H_CON)&&!memcmp(guid,&G_GOP,sizeof *guid)){*iface=NULL;return EFI_DEVICE_ERROR;}
+  return bs_handle(handle,guid,iface);
+}
+static EFI_STATUS EFIAPI excessive_gop_buffer(EFI_LOCATE_SEARCH_TYPE t,EFI_GUID *g,VOID *key,UINTN *n,EFI_HANDLE **buf){
+  EFI_STATUS s=bs_locate_buffer(t,g,key,n,buf);if(s==EFI_SUCCESS)*n=129;return s;
+}
+static void s_preflight_diagnostics(void){
+  begin("diagnostic: healthy target and other GPU enumeration");
+  Fg.cfg.igpu_gop=1;rebuild();CHECK(pre()==EFI_SUCCESS);
+  CHECK(strstr(CapturedLog,"preflight GOP["));
+  CHECK(strstr(CapturedLog,"path_status=0"));
+  CHECK(strstr(CapturedLog,"target=1"));CHECK(strstr(CapturedLog,"target=0"));
+  CHECK(strstr(CapturedLog,"screen=1"));CHECK(strstr(CapturedLog,"required_screens=1"));
+  CHECK(strstr(CapturedLog,"reason=accepted"));CHECK(!HighTplLogs);
+
+  begin("diagnostic: console framebuffer GOP missing its path is still refused");
+  fg_gop_data(6,FgMode[0].FrameBufferBase,FgMode[0].FrameBufferSize);fg_add_proto(H_CON,&G_GOP,&FgGop[6]);
+  refused_clean(pre(),EFI_NOT_READY);
+  CHECK(strstr(CapturedLog,"reason=console-alias-requires-proof"));
+  CHECK(strstr(CapturedLog,"console_out_handle=1 console_in_handle=1 console_err_handle=1"));
+  CHECK(strstr(CapturedLog,"preflight GOP check: enum_status="));CHECK(!HighTplLogs);
+  /* The console handle precedes the physical child in the fake handle database. A refusal
+     at that first GOP must not conceal the later physical GOP's topology. */
+  CHECK(strstr(CapturedLog,"preflight GOP survey[0]:"));
+  CHECK(strstr(CapturedLog,"preflight GOP survey[1]:"));
+  {const char *later=strstr(CapturedLog,"preflight GOP survey[1]:");
+    CHECK(strstr(later,"target=1"));CHECK(strstr(later,"screen=1"));}
+  CHECK(strstr(CapturedLog,"preflight GOP survey complete: examined=2"));
+
+  begin("diagnostic: survey continues after the first GOP protocol error");
+  fg_gop_data(6,0,0);fg_add_proto(H_CON,&G_GOP,&FgGop[6]);FgBs.HandleProtocol=failed_console_gop;
+  refused_clean(pre(),EFI_NOT_READY);
+  CHECK(strstr(CapturedLog,"reason=invalid-gop-protocol"));
+  CHECK(strstr(CapturedLog,"preflight GOP survey[1]:"));
+  CHECK(strstr(CapturedLog,"preflight GOP survey complete: examined=2"));CHECK(!HighTplLogs);
+
+  begin("diagnostic: survey never follows a GOP count above its bounded limit");
+  FgBs.LocateHandleBuffer=excessive_gop_buffer;refused_clean(pre(),EFI_NOT_READY);
+  CHECK(strstr(CapturedLog,"count=129 max_handles=128"));
+  CHECK(!strstr(CapturedLog,"preflight GOP survey[0]:"));CHECK(!HighTplLogs);
+
+  begin("diagnostic: console GOP without framebuffer still follows the original skip rule");
+  fg_gop_data(6,0,0);fg_add_proto(H_CON,&G_GOP,&FgGop[6]);CHECK(pre()==EFI_SUCCESS);
+  CHECK(strstr(CapturedLog,"reason=no-framebuffer-or-mode"));
+  CHECK(strstr(CapturedLog,"path_lookup=not-required"));CHECK(!HighTplLogs);
+
+  begin("diagnostic: GOP enumeration error remains a refusal");
+  FgBs.LocateHandleBuffer=failed_gop_buffer;refused_clean(pre(),EFI_NOT_READY);
+  CHECK(strstr(CapturedLog,"reason=enumeration-refused"));CHECK(!HighTplLogs);
+
+  begin("diagnostic: zero-child owner with untracked target screen stays refused");
+  {FG_PROTO *p=fg_find(H(H_GPU),&G_PATH);fg_remove_opens(p,H(H_NV),EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER);}
+  refused_clean(pre(),EFI_NOT_READY);
+  CHECK(strstr(CapturedLog,"owner_children=0"));CHECK(strstr(CapturedLog,"screens=1"));
+  CHECK(strstr(CapturedLog,"reason=unexpected-target-screen"));CHECK(!HighTplLogs);
+
+  begin("diagnostic: console identity drift is distinguished from GOP failure");
+  FgBs.LocateHandleBuffer=console_changed_buffer;refused_clean(pre(),EFI_NOT_READY);
+  CHECK(strstr(CapturedLog,"reason=accepted"));
+  CHECK(strstr(CapturedLog,"preflight console: changed=1"));
+  CHECK(strstr(CapturedLog,"text=1"));CHECK(!HighTplLogs);
+}
+
+/* Synthetic hybrid topology: no target children, a non-target GOP and its pathless console clone. */
+static void alias_topology(int driver){
+  Fg.cfg.driver=driver;Fg.cfg.nchild=0;Fg.cfg.igpu_gop=1;rebuild();
+  FgMode[7].MaxMode=4;FgMode[7].Mode=0;FgMode[7].FrameBufferBase=0x200000000ULL;FgMode[7].FrameBufferSize=0x300000;
+  FgInfo[7].HorizontalResolution=1024;FgInfo[7].VerticalResolution=768;FgInfo[7].PixelsPerScanLine=1024;
+  FgInfo[6]=FgInfo[7];FgMode[6]=FgMode[7];FgMode[6].Info=&FgInfo[6];FgGop[6]=(EFI_GRAPHICS_OUTPUT_PROTOCOL){.Mode=&FgMode[6]};
+  fg_add_proto(H_CON,&G_GOP,&FgGop[6]);
+}
+static EFI_STATUS EFIAPI reversed_gop_buffer(EFI_LOCATE_SEARCH_TYPE t,EFI_GUID *g,VOID *key,UINTN *n,EFI_HANDLE **buf){
+  EFI_STATUS s=bs_locate_buffer(t,g,key,n,buf);
+  if(s==EFI_SUCCESS)for(UINTN i=0;i<*n/2;i++){EFI_HANDLE tmp=(*buf)[i];(*buf)[i]=(*buf)[*n-1-i];(*buf)[*n-1-i]=tmp;}
+  return s;
+}
+static void add_extra_gop(int under_target,UINT64 base,UINT64 size){
+  int origin=under_target?H_GPU:H_IGPU,len=dp_prefix(Fg.path[origin]);
+  memcpy(Fg.path[H_OTHER],Fg.path[origin],(size_t)len);dp_end(Fg.path[H_OTHER],dp_adr(Fg.path[H_OTHER],len,0x80010360));
+  FgInfo[5]=FgInfo[7];FgMode[5]=FgMode[7];FgMode[5].Info=&FgInfo[5];
+  FgMode[5].FrameBufferBase=base;FgMode[5].FrameBufferSize=size;FgGop[5]=(EFI_GRAPHICS_OUTPUT_PROTOCOL){.Mode=&FgMode[5]};
+  fg_add_proto(H_OTHER,&G_PATH,Fg.path[H_OTHER]);fg_add_proto(H_OTHER,&G_GOP,&FgGop[5]);
+}
+static void s_verified_console_alias(void){
+  for(int driver=0;driver<2;driver++)for(int reverse=0;reverse<2;reverse++)for(int finish=0;finish<2;finish++){
+    begin("hybrid console clone, both orders, bound/unbound target, recover/transaction finish");alias_topology(driver);
+    if(reverse)FgBs.LocateHandleBuffer=reversed_gop_buffer;
+    CHECK(pre()==EFI_SUCCESS);CHECK(Plan.owner.child_count==0);
+    CHECK(strstr(CapturedLog,"preflight console GOP alias: verified=1"));
+    CHECK(GuRelRelease()==EFI_SUCCESS&&GuRelReleased());if(driver)quiet_window();
+    BOOLEAN gop=FALSE;
+    if(finish){GuStarted();GuQuiesced();Gu.flrs=1;regs_unlocked();CHECK(GuRelFinish(&gop)==EFI_SUCCESS&&gop);CHECK(GuRelReadyForWindows(TRUE));}
+    else{CHECK(GuRelRecover(&gop)==EFI_SUCCESS&&gop);CHECK(GuRelReadyForWindows(FALSE));}
+    CHECK(!Gu.owned&&!claim_held()&&Fg.connect_calls==driver&&gop_under_gpu()==0);
+    CHECK(no_writes_issued()&&tpl_ok()&&!HighTplLogs);
+  }
+  begin("StdErr-only pathless console alias is proven by the same strict rule");alias_topology(1);
+  Fg.h[H_CON].nprotos--;FgSt.StandardErrorHandle=H(H_OTHER);fg_add_proto(H_OTHER,&G_GOP,&FgGop[6]);
+  CHECK(pre()==EFI_SUCCESS&&GuRelRelease()==EFI_SUCCESS&&GuRelReleased());recover_and_ready(0);
+}
+static int DriftKind,ParentPciCalls;
+static int AliasGopReads;
+static EFI_STATUS EFIAPI target_classification_drift(EFI_HANDLE h,EFI_GUID *g,VOID **iface){
+  EFI_STATUS s=bs_handle(h,g,iface);
+  if(h==H(H_CON)&&!memcmp(g,&G_GOP,sizeof *g)&&++AliasGopReads==2){
+    int len=dp_prefix(Fg.path[H_GPU]);memcpy(Fg.path[H_OTHER],Fg.path[H_GPU],(size_t)len);
+    dp_end(Fg.path[H_OTHER],dp_adr(Fg.path[H_OTHER],len,0x80010360));
+  }
+  return s;
+}
+static int AliasFreeDrift;
+static EFI_STATUS EFIAPI alias_free_drift(VOID *p){
+  EFI_STATUS s=bs_free(p);
+  if(AliasFreeDrift&&ParentPciCalls==2){FgInfo[6].Version++;AliasFreeDrift=0;}
+  return s;
+}
+static EFI_STATUS EFIAPI alias_drift_handle(EFI_HANDLE h,EFI_GUID *g,VOID **iface){
+  EFI_STATUS s=bs_handle(h,g,iface);
+  if(h==H(H_IGPU)&&!memcmp(g,&G_PCI,sizeof *g)&&++ParentPciCalls==2){
+    if(DriftKind==1)FgInfo[6].Version++;
+    if(DriftKind==2)FgInfo[7].PixelInformation.ReservedMask++;
+    if(DriftKind==3)Fg.path[H_IGOP][4]^=1;
+    if(DriftKind==4)FgMode[6].FrameBufferBase+=0x1000;
+    if(DriftKind==5)FgMode[7].FrameBufferBase+=0x1000;
+    if(DriftKind==6)FgSt.ConOut=&FgOutOther;
+  }
+  return s;
+}
+static int PathFault;
+static EFI_STATUS EFIAPI alias_path_fault(EFI_HANDLE h,EFI_GUID *g,VOID **iface){
+  if(h==H(H_CON)&&!memcmp(g,&G_PATH,sizeof *g)){
+    *iface=PathFault==2?Fg.path[H_IGOP]:NULL;return PathFault==1?EFI_DEVICE_ERROR:EFI_UNSUPPORTED;
+  }
+  if(PathFault==3&&h==H(H_IGPU)&&!memcmp(g,&G_PCI,sizeof *g)){*iface=NULL;return EFI_UNSUPPORTED;}
+  return bs_handle(h,g,iface);
+}
+static EFI_STATUS EFIAPI alias_parent_fail(EFI_GUID *g,EFI_DEVICE_PATH_PROTOCOL **p,EFI_HANDLE *h){
+  (void)g;(void)p;*h=NULL;return PathFault==4?EFI_SUCCESS:EFI_NOT_FOUND;
+}
+static void s_alias_refusals(void){
+  for(int change=0;change<17;change++){
+    begin("console alias metadata/full Info mismatch or invalid mode is refused");alias_topology(1);
+    switch(change){
+      case 0:FgInfo[6].Version++;break;
+      case 1:FgInfo[6].PixelInformation.RedMask++;break;
+      case 2:FgInfo[6].PixelInformation.GreenMask++;break;
+      case 3:FgInfo[6].PixelInformation.BlueMask++;break;
+      case 4:FgInfo[6].PixelInformation.ReservedMask++;break;
+      case 5:FgInfo[6].HorizontalResolution--;break;
+      case 6:FgInfo[6].VerticalResolution--;break;
+      case 7:FgInfo[6].PixelsPerScanLine++;break;
+      case 8:FgInfo[6].PixelFormat=PixelRedGreenBlueReserved8BitPerColor;break;
+      case 9:FgMode[6].MaxMode++;break;
+      case 10:FgMode[6].Mode++;break;
+      case 11:FgMode[6].SizeOfInfo++;break;
+      case 12:FgMode[6].FrameBufferBase+=0x1000;break;
+      case 13:FgMode[6].FrameBufferSize+=0x1000;break;
+      case 14:FgMode[6].Info=NULL;break;
+      case 15:FgMode[6].MaxMode=0;break;
+      case 16:FgMode[6].FrameBufferBase=~(UINT64)0-0x1000;break;
+    }
+    refused_clean(pre(),EFI_NOT_READY);CHECK(!HighTplLogs);
+  }
+  begin("pathless console without its physical counterpart is refused");alias_topology(1);Fg.h[H_IGOP].nprotos--;
+  refused_clean(pre(),EFI_NOT_READY);
+  begin("two matching non-target physical GOPs are ambiguous");alias_topology(1);
+  add_extra_gop(0,FgMode[7].FrameBufferBase,FgMode[7].FrameBufferSize);refused_clean(pre(),EFI_NOT_READY);
+  begin("unknown pathless framebuffer GOP is refused");alias_topology(1);
+  Fg.h[H_CON].nprotos--;fg_add_proto(H_OTHER,&G_GOP,&FgGop[6]);refused_clean(pre(),EFI_NOT_READY);
+  begin("ConsoleIn-only pathless framebuffer GOP is refused");alias_topology(1);
+  Fg.h[H_CON].nprotos--;FgSt.ConsoleInHandle=H(H_OTHER);fg_add_proto(H_OTHER,&G_GOP,&FgGop[6]);refused_clean(pre(),EFI_NOT_READY);
+  begin("matching physical target GOP is never a non-target counterpart");alias_topology(1);
+  {int len=dp_prefix(Fg.path[H_GPU]);memcpy(Fg.path[H_IGOP],Fg.path[H_GPU],(size_t)len);dp_end(Fg.path[H_IGOP],dp_adr(Fg.path[H_IGOP],len,0x80010300));}
+  refused_clean(pre(),EFI_NOT_READY);
+  begin("a target framebuffer overlapping the proven non-target alias is refused");alias_topology(1);
+  add_extra_gop(1,FgMode[7].FrameBufferBase+0x1000,FgMode[7].FrameBufferSize);
+  refused_clean(pre(),EFI_NOT_READY);CHECK(strstr(CapturedLog,"preflight console GOP alias: verified=0"));
+  begin("unrelated target screen still counts and rejects a zero-child owner");alias_topology(1);
+  add_extra_gop(1,0xf000000000ULL,FgMode[7].FrameBufferSize);refused_clean(pre(),EFI_NOT_READY);
+  CHECK(strstr(CapturedLog,"preflight console GOP alias: verified=1"));CHECK(strstr(CapturedLog,"reason=unexpected-target-screen"));
+  begin("proof snapshots cannot conceal a target GOP appearing after the original count");alias_topology(1);
+  add_extra_gop(0,0xf000000000ULL,FgMode[7].FrameBufferSize);AliasGopReads=0;FgBs.HandleProtocol=target_classification_drift;
+  refused_clean(pre(),EFI_NOT_READY);CHECK(!HighTplLogs);
+  begin("invalid target framebuffer range refuses rather than bypassing overlap");alias_topology(1);
+  add_extra_gop(1,~(UINT64)0-0x1000,FgMode[7].FrameBufferSize);refused_clean(pre(),EFI_NOT_READY);
+  begin("non-target physical framebuffer range overflow is refused");alias_topology(1);
+  FgMode[7].FrameBufferBase=~(UINT64)0-0x1000;refused_clean(pre(),EFI_NOT_READY);
+  begin("a malformed physical device path refuses before firmware walks it");alias_topology(1);
+  Fg.path[H_IGOP][2]=0;refused_clean(pre(),EFI_NOT_READY);
+  for(PathFault=1;PathFault<=3;PathFault++){
+    begin("path lookup errors or unproven PCI parent are never alias proof");alias_topology(1);
+    FgBs.HandleProtocol=alias_path_fault;refused_clean(pre(),EFI_NOT_READY);
+  }
+  for(PathFault=4;PathFault<=5;PathFault++){
+    begin("failed or null parent resolution is refused");alias_topology(1);
+    FgBs.LocateDevicePath=alias_parent_fail;refused_clean(pre(),EFI_NOT_READY);
+  }
+  for(DriftKind=1;DriftKind<=6;DriftKind++){
+    begin("last parent callback drifts an earlier mode/path/console snapshot");alias_topology(1);ParentPciCalls=0;
+    FgBs.HandleProtocol=alias_drift_handle;refused_clean(pre(),EFI_NOT_READY);CHECK(ParentPciCalls==2&&!HighTplLogs);
+  }
+  for(int log_drift=1;log_drift<=2;log_drift++){
+    begin("preflight logging callback changes an otherwise proven alias");alias_topology(1);AliasLogDrift=log_drift;
+    refused_clean(pre(),EFI_NOT_READY);CHECK(AliasLogDrift==0&&!HighTplLogs);
+  }
+  begin("GopCount final FreePool callback changes a previously proven alias");alias_topology(1);
+  ParentPciCalls=0;DriftKind=0;AliasFreeDrift=1;FgBs.HandleProtocol=alias_drift_handle;FgBs.FreePool=alias_free_drift;
+  refused_clean(pre(),EFI_NOT_READY);CHECK(AliasFreeDrift==0&&!HighTplLogs);
+  begin("console identity guard remains enforced after alias acceptance");alias_topology(1);
+  CHECK(pre()==EFI_SUCCESS);FgSt.ConOut=&FgOutOther;
+  CHECK(GuRelRelease()==EFI_NOT_READY&&Fg.disconnect_calls==0&&!GuRelMutated());CHECK(no_writes_issued()&&!HighTplLogs);
+  begin("fresh alias validation remains active in the final ready check");alias_topology(1);
+  CHECK(pre()==EFI_SUCCESS&&GuRelRelease()==EFI_SUCCESS);BOOLEAN gop=FALSE;CHECK(GuRelRecover(&gop)==EFI_SUCCESS&&gop);
+  FgInfo[6].PixelInformation.BlueMask++;CHECK(!GuRelReadyForWindows(FALSE));
+  FgInfo[6].PixelInformation.BlueMask--;CHECK(GuRelReadyForWindows(FALSE));
+  begin("released target GOP residue still rejects even beside a validated alias");alias_topology(1);
+  CHECK(pre()==EFI_SUCCESS&&GuRelRelease()==EFI_SUCCESS);
+  add_extra_gop(1,0xf000000000ULL,FgMode[7].FrameBufferSize);CHECK(!GuRelReleased());CHECK(no_writes_issued()&&!HighTplLogs);
+  begin("released-count proof rejects a target GOP appearing after its initial traversal");alias_topology(1);
+  CHECK(pre()==EFI_SUCCESS&&GuRelRelease()==EFI_SUCCESS);
+  add_extra_gop(0,0xf000000000ULL,FgMode[7].FrameBufferSize);AliasGopReads=0;FgBs.HandleProtocol=target_classification_drift;
+  CHECK(!GuRelReleased());CHECK(no_writes_issued()&&!HighTplLogs);
+  begin("a removed target's saved framebuffer cannot become a non-target console alias");
+  Fg.cfg.igpu_gop=1;rebuild();
+  FgInfo[6]=FgInfo[7];FgMode[6]=FgMode[7];FgMode[6].Info=&FgInfo[6];FgGop[6]=(EFI_GRAPHICS_OUTPUT_PROTOCOL){.Mode=&FgMode[6]};
+  fg_add_proto(H_CON,&G_GOP,&FgGop[6]);
+  CHECK(pre()==EFI_SUCCESS&&Plan.owner.child_count==1&&GuRelRelease()==EFI_SUCCESS);
+  FgMode[6].FrameBufferBase=FgMode[7].FrameBufferBase=Plan.owner.children[0].framebuffer;
+  CHECK(!GuRelReleased());CHECK(no_writes_issued()&&!HighTplLogs);
+}
+
 int main(int argc,char **argv){
   verbose=argc>1&&!strcmp(argv[1],"-v");
+  s_verified_console_alias();
+  s_alias_refusals();
+  s_preflight_diagnostics();
   s_release_test(0);s_release_test(1);s_io_decode();
   s_post_transaction(0,0);s_post_transaction(1,1);
   s_bme_entry(0,0,0);s_bme_entry(1,0,0);s_bme_entry(0,1,0);s_bme_entry(1,1,0);s_bme_entry(0,0,1);s_bme_entry(1,1,1);

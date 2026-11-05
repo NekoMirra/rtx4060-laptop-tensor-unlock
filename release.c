@@ -196,41 +196,272 @@ static BOOLEAN SameOwner(const OWNER *a,const OWNER *b) {
 }
 /* GOPs with a framebuffer whose device path descends from this GPU: screens, and the rest (a mode
    that is not a screen). GOPs of other devices, and virtual or blt-only ones, are not counted. */
-static EFI_STATUS GopCount(UINTN *screens,UINTN *rest) {
+static EFI_STATUS SurveyPathShape(const EFI_DEVICE_PATH_PROTOCOL *path,UINTN *bytes);
+typedef struct {
+  EFI_HANDLE handle,parent;EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
+  EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *mode_ptr,mode;
+  EFI_GRAPHICS_OUTPUT_MODE_INFORMATION info;
+  EFI_DEVICE_PATH_PROTOCOL *path;EFI_PCI_IO_PROTOCOL *parent_pci;
+  EFI_STATUS path_status;UINTN path_bytes;UINT8 path_sha256[32];
+} GOP_VIEW;
+/* Bounded scratch, like Plan: no allocation/free callback after the final memory comparison.
+   Refuse reentry rather than allowing a firmware callback to overwrite an active snapshot. */
+static GOP_VIEW AliasViews[128];static BOOLEAN AliasBusy,AliasProofUsed;static UINTN AliasViewCount;
+static BOOLEAN MissingPath(EFI_STATUS s,const VOID *p){return !p&&(s==EFI_UNSUPPORTED||s==EFI_NOT_FOUND);}
+static BOOLEAN HasFramebuffer(const GOP_VIEW *v){return v->mode_ptr&&(v->mode.FrameBufferBase||v->mode.FrameBufferSize);}
+static BOOLEAN RangeValid(UINT64 base,UINT64 size){return base&&size&&size<=~(UINT64)0-base;}
+static BOOLEAN Overlap(UINT64 a,UINT64 an,UINT64 b,UINT64 bn){return a<b+bn&&b<a+an;}
+/* The existing Screen predicate, applied to a captured view for count consistency. */
+static BOOLEAN CountedViewScreen(const GOP_VIEW *v){
+  const EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *m=&v->mode;
+  return v->mode_ptr&&m->Info&&m->SizeOfInfo>=sizeof(v->info)&&m->FrameBufferBase&&m->FrameBufferSize&&
+    v->info.HorizontalResolution&&v->info.VerticalResolution&&
+    v->info.PixelFormat<=PixelBlueGreenRedReserved8BitPerColor&&v->info.PixelsPerScanLine>=v->info.HorizontalResolution&&
+    (UINT64)v->info.PixelsPerScanLine*v->info.VerticalResolution<=m->FrameBufferSize/4;
+}
+static BOOLEAN ViewScreen(const GOP_VIEW *v){
+  return CountedViewScreen(v)&&v->mode.SizeOfInfo==sizeof(v->info)&&
+    RangeValid(v->mode.FrameBufferBase,v->mode.FrameBufferSize)&&v->mode.MaxMode&&v->mode.Mode<v->mode.MaxMode;
+}
+static BOOLEAN ReadGopView(EFI_HANDLE h,GOP_VIEW *v){
+  memset(v,0,sizeof(*v));v->handle=h;
+  EFI_STATUS s=Gu.bs->HandleProtocol(h,&GopGuid,(VOID **)&v->gop);
+  if(EFI_ERROR(s)||!v->gop)return FALSE;
+  v->mode_ptr=v->gop->Mode;
+  if(v->mode_ptr){
+    memcpy(&v->mode,v->mode_ptr,sizeof(v->mode));
+    /* Only the complete, known Info layout can be compared. Unknown extension bytes refuse. */
+    if(v->mode.Info){if(v->mode.SizeOfInfo!=sizeof(v->info))return FALSE;memcpy(&v->info,v->mode.Info,sizeof(v->info));}
+    else if(v->mode.SizeOfInfo||HasFramebuffer(v))return FALSE;
+    if(HasFramebuffer(v)&&!RangeValid(v->mode.FrameBufferBase,v->mode.FrameBufferSize))return FALSE;
+  }
+  v->path_status=Gu.bs->HandleProtocol(h,&PathGuid,(VOID **)&v->path);
+  if(MissingPath(v->path_status,v->path))return TRUE;
+  if(v->path_status!=EFI_SUCCESS||!v->path||SurveyPathShape(v->path,&v->path_bytes)!=EFI_SUCCESS)return FALSE;
+  GuSha256(v->path,v->path_bytes,v->path_sha256);
+  if(HasFramebuffer(v)){
+    EFI_DEVICE_PATH_PROTOCOL *left=v->path;
+    s=Gu.bs->LocateDevicePath(&PciGuid,&left,&v->parent);
+    if(EFI_ERROR(s)||!v->parent)return FALSE;
+    s=Gu.bs->HandleProtocol(v->parent,&PciGuid,(VOID **)&v->parent_pci);
+    if(EFI_ERROR(s)||!v->parent_pci)return FALSE;
+  }
+  return TRUE;
+}
+/* No callbacks: catch changes to an earlier snapshot during any later protocol/path callback. */
+static BOOLEAN GopViewMemoryStable(const GOP_VIEW *v){
+  if(v->gop->Mode!=v->mode_ptr)return FALSE;
+  if(v->mode_ptr&&(memcmp(v->mode_ptr,&v->mode,sizeof(v->mode))||
+      (v->mode.Info&&memcmp(v->mode.Info,&v->info,sizeof(v->info)))))return FALSE;
+  if(v->path){UINTN bytes=0;UINT8 hash[32];
+    if(SurveyPathShape(v->path,&bytes)!=EFI_SUCCESS||bytes!=v->path_bytes)return FALSE;
+    GuSha256(v->path,bytes,hash);if(memcmp(hash,v->path_sha256,sizeof hash))return FALSE;
+  }
+  return TRUE;
+}
+static BOOLEAN SameFramebufferMode(const GOP_VIEW *a,const GOP_VIEW *b){
+  return ViewScreen(a)&&ViewScreen(b)&&a->mode.MaxMode==b->mode.MaxMode&&a->mode.Mode==b->mode.Mode&&
+    a->mode.SizeOfInfo==b->mode.SizeOfInfo&&a->mode.FrameBufferBase==b->mode.FrameBufferBase&&
+    a->mode.FrameBufferSize==b->mode.FrameBufferSize&&!memcmp(&a->info,&b->info,sizeof(a->info));
+}
+static BOOLEAN ProveConsoleAliases(EFI_HANDLE *handles,UINTN count,UINTN screens,UINTN rest){
+  if(!count||count>128)return FALSE;
+  for(UINTN i=0;i<count;i++){
+    for(UINTN j=0;j<i;j++)if(handles[i]==handles[j])return FALSE;
+    if(!ReadGopView(handles[i],&AliasViews[i]))return FALSE;
+  }
+  /* The fresh enumeration must describe the same set; its allocation is freed before
+     re-reading protocols and before the final callback-free memory comparison. */
+  EFI_HANDLE *fresh=NULL;UINTN n=0;
+  EFI_STATUS s=Gu.bs->LocateHandleBuffer(ByProtocol,&GopGuid,NULL,&n,&fresh);
+  BOOLEAN same=s==EFI_SUCCESS&&fresh&&n==count;
+  if(same)for(UINTN i=0;i<count;i++){
+    UINTN matches=0;for(UINTN j=0;j<n;j++)if(handles[i]==fresh[j])matches++;
+    if(matches!=1)same=FALSE;
+  }
+  if(fresh&&Gu.bs->FreePool(fresh)!=EFI_SUCCESS)same=FALSE;
+  if(!same)return FALSE;
+  for(UINTN i=0;i<count;i++){
+    GOP_VIEW again;if(!ReadGopView(handles[i],&again)||memcmp(&again,&AliasViews[i],sizeof again))return FALSE;
+  }
+  for(UINTN i=0;i<count;i++)if(!GopViewMemoryStable(&AliasViews[i]))return FALSE;
+  /* Proof callbacks may have changed a physical GOP after the original traversal.
+     The same stable views proving aliases must also agree with its target count. */
+  UINTN fresh_screens=0,fresh_rest=0;
+  for(UINTN i=0;i<count;i++)if(AliasViews[i].parent==Gu.handle&&HasFramebuffer(&AliasViews[i])){
+    if(CountedViewScreen(&AliasViews[i]))fresh_screens++;else fresh_rest++;
+  }
+  if(fresh_screens!=screens||fresh_rest!=rest)return FALSE;
+  for(UINTN i=0;i<count;i++){
+    const GOP_VIEW *a=&AliasViews[i];
+    if(a->path||!HasFramebuffer(a))continue;
+    if(!MissingPath(a->path_status,a->path)||(a->handle!=Plan.console_out&&a->handle!=Plan.console_err)||!ViewScreen(a))return FALSE;
+    UINT64 base=a->mode.FrameBufferBase,size=a->mode.FrameBufferSize;
+    /* Retain the target's preflight ranges even while its physical GOP is temporarily gone. */
+    for(UINTN j=0;j<Plan.owner.child_count;j++){
+      const CHILD *c=&Plan.owner.children[j];
+      if(!(c->framebuffer||c->framebuffer_size))continue;
+      if(!RangeValid(c->framebuffer,c->framebuffer_size)||Overlap(base,size,c->framebuffer,c->framebuffer_size))return FALSE;
+    }
+    UINTN matches=0;
+    for(UINTN j=0;j<count;j++){
+      const GOP_VIEW *p=&AliasViews[j];if(!p->path||!HasFramebuffer(p))continue;
+      if(p->parent==Gu.handle){if(Overlap(base,size,p->mode.FrameBufferBase,p->mode.FrameBufferSize))return FALSE;}
+      else if(p->parent&&p->parent_pci&&SameFramebufferMode(a,p))matches++;
+    }
+    if(matches!=1)return FALSE;
+  }
+  return TRUE;
+}
+/* log is TRUE only in preflight, never in release's quiet window or at raised TPL. */
+static EFI_STATUS GopCount(UINTN *screens,UINTN *rest,BOOLEAN log) {
   EFI_HANDLE *h=NULL;UINTN count=0;*screens=*rest=0;
+  BOOLEAN deferred_alias=FALSE;
   EFI_STATUS s=Gu.bs->LocateHandleBuffer(ByProtocol,&GopGuid,NULL,&count,&h);
+  if(log)NOTE("preflight GOP enumeration: status=%#llx count=%zu buffer=%#llx\n",(unsigned long long)s,(size_t)count,(unsigned long long)(UINTN)h);
   if(s==EFI_NOT_FOUND)return EFI_SUCCESS;
   if(s==EFI_SUCCESS&&(!h||!count||count>128))s=EFI_UNSUPPORTED;
   for(UINTN i=0;s==EFI_SUCCESS&&i<count;i++) {
     EFI_GRAPHICS_OUTPUT_PROTOCOL *g=NULL;EFI_DEVICE_PATH_PROTOCOL *path=NULL;UINTN bytes=0;
     s=Gu.bs->HandleProtocol(h[i],&GopGuid,(VOID **)&g);
-    if(EFI_ERROR(s)||!g){s=EFI_COMPROMISED_DATA;break;}
-    if(!g->Mode||(!g->Mode->FrameBufferBase&&!g->Mode->FrameBufferSize))continue; /* virtual / blt-only */
-    if(Gu.bs->HandleProtocol(h[i],&PathGuid,(VOID **)&path)!=EFI_SUCCESS||!path){s=EFI_UNSUPPORTED;break;}
+    if(log)NOTE("preflight GOP[%u]: handle=%#llx protocol_status=%#llx protocol=%#llx console_out_handle=%u console_in_handle=%u console_err_handle=%u\n",(unsigned)i,
+      (unsigned long long)(UINTN)h[i],(unsigned long long)s,(unsigned long long)(UINTN)g,
+      h[i]==Plan.console_out,h[i]==Plan.console_in,h[i]==Plan.console_err);
+    if(EFI_ERROR(s)||!g){if(log)NOTE("preflight GOP[%u]: reason=invalid-gop-protocol\n",(unsigned)i);s=EFI_COMPROMISED_DATA;break;}
+    const EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *m=g->Mode;
+    const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info=m&&m->Info&&m->SizeOfInfo>=sizeof(*m->Info)?m->Info:NULL;
+    if(log)NOTE("preflight GOP[%u]: mode=%#llx info=%#llx info_bytes=%zu max_mode=%u mode_index=%u fb=%#llx fb_bytes=%#llx width=%u height=%u stride=%u format=%u screen=%u\n",
+      (unsigned)i,(unsigned long long)(UINTN)m,(unsigned long long)(UINTN)(m?m->Info:NULL),m?(size_t)m->SizeOfInfo:0,
+      m?m->MaxMode:0,m?m->Mode:0,(unsigned long long)(m?m->FrameBufferBase:0),(unsigned long long)(m?m->FrameBufferSize:0),
+      info?info->HorizontalResolution:0,info?info->VerticalResolution:0,info?info->PixelsPerScanLine:0,info?(unsigned)info->PixelFormat:0,Screen(g));
+    if(!g->Mode||(!g->Mode->FrameBufferBase&&!g->Mode->FrameBufferSize)){
+      if(log)NOTE("preflight GOP[%u]: path_lookup=not-required reason=no-framebuffer-or-mode\n",(unsigned)i);
+      continue; /* virtual / blt-only: unchanged admission rule */
+    }
+    EFI_STATUS path_status=Gu.bs->HandleProtocol(h[i],&PathGuid,(VOID **)&path);
+    if(log)NOTE("preflight GOP[%u]: path_status=%#llx path=%#llx\n",(unsigned)i,(unsigned long long)path_status,(unsigned long long)(UINTN)path);
+    if(path_status!=EFI_SUCCESS||!path){
+      if(MissingPath(path_status,path)&&(h[i]==Plan.console_out||h[i]==Plan.console_err)){
+        deferred_alias=TRUE;if(log)NOTE("preflight GOP[%u]: reason=console-alias-requires-proof\n",(unsigned)i);continue;
+      }
+      if(log)NOTE("preflight GOP[%u]: reason=missing-device-path\n",(unsigned)i);s=EFI_UNSUPPORTED;break;
+    }
+    /* Validate the entire bounded path before a firmware resolver may walk it. */
+    s=SurveyPathShape(path,&bytes);if(EFI_ERROR(s))break;
     EFI_HANDLE parent=NULL;EFI_DEVICE_PATH_PROTOCOL *left=path;
-    if(EFI_ERROR(Gu.bs->LocateDevicePath(&PciGuid,&left,&parent))||parent!=Gu.handle)continue; /* another device's */
-    s=GpuPath(h[i],&path,&bytes);if(EFI_ERROR(s))break; /* ours, malformed path */
+    EFI_STATUS parent_status=Gu.bs->LocateDevicePath(&PciGuid,&left,&parent);
+    if(log)NOTE("preflight GOP[%u]: parent_status=%#llx parent=%#llx target_handle=%#llx target=%u remaining=%#llx\n",(unsigned)i,
+      (unsigned long long)parent_status,(unsigned long long)(UINTN)parent,(unsigned long long)(UINTN)Gu.handle,
+      !EFI_ERROR(parent_status)&&parent==Gu.handle,(unsigned long long)(UINTN)left);
+    if(EFI_ERROR(parent_status)||parent!=Gu.handle)continue; /* another device's */
+    s=GpuPath(h[i],&path,&bytes);
+    if(log)NOTE("preflight GOP[%u]: target_path_status=%#llx path_bytes=%zu\n",(unsigned)i,(unsigned long long)s,(size_t)bytes);
+    if(EFI_ERROR(s))break; /* ours, malformed path */
     if(Screen(g))(*screens)++;else (*rest)++;
+  }
+  if(s==EFI_SUCCESS&&deferred_alias){
+    BOOLEAN valid=ProveConsoleAliases(h,count,*screens,*rest);AliasProofUsed=valid;AliasViewCount=valid?count:0;
+    if(log)NOTE("preflight console GOP alias: verified=%u policy=unique-stable-non-target-framebuffer\n",valid);
+    if(!valid)s=EFI_UNSUPPORTED;
   }
   if(h)Gu.bs->FreePool(h);
   return s;
 }
 /* attached: the driver's screens are back (at least one if it had any); released: no GOP of this GPU remains. */
-static BOOLEAN Gops(BOOLEAN attached) {
-  UINTN screens,rest,want=0;EFI_STATUS s=GopCount(&screens,&rest);
-  if(EFI_ERROR(s))return FALSE;
-  if(!attached)return !screens&&!rest;
+static BOOLEAN GopsChecked(BOOLEAN attached,BOOLEAN log) {
+  if(AliasBusy)return FALSE;AliasBusy=TRUE;AliasProofUsed=FALSE;AliasViewCount=0;
+  UINTN screens,rest,want=0;EFI_STATUS s=GopCount(&screens,&rest,log);
   for(UINTN i=0;i<Plan.owner.child_count;i++)if(Plan.owner.children[i].screen)want++;
-  if(want)return screens>0&&screens<=MAX_CHILDREN;
-  return Plan.owner.child_count?screens<=MAX_CHILDREN:!screens;
+  BOOLEAN ok;
+  if(EFI_ERROR(s))ok=FALSE;
+  else if(!attached)ok=!screens&&!rest;
+  else if(want)ok=screens>0&&screens<=MAX_CHILDREN;
+  else ok=Plan.owner.child_count?screens<=MAX_CHILDREN:!screens;
+  if(log)NOTE("preflight GOP check: enum_status=%#llx attached=%u owner_children=%zu required_screens=%zu screens=%zu rest=%zu accepted=%u reason=%s\n",
+    (unsigned long long)s,attached,(size_t)Plan.owner.child_count,(size_t)want,(size_t)screens,(size_t)rest,ok,
+    EFI_ERROR(s)?"enumeration-refused":ok?"accepted":!attached?"target-gop-still-present":
+    want&&!screens?"required-target-screen-missing":screens>MAX_CHILDREN?"too-many-target-screens":"unexpected-target-screen");
+  /* GopCount's FreePool and the optional preflight log are callbacks too. Recheck
+     after both, with the scratch protected against reentry, before returning success. */
+  if(ok&&AliasProofUsed)for(UINTN i=0;i<AliasViewCount;i++)
+    if(!GopViewMemoryStable(&AliasViews[i])){ok=FALSE;break;}
+  AliasBusy=FALSE;return ok;
 }
-static EFI_STATUS Alive(VOID) {
+static BOOLEAN Gops(BOOLEAN attached){return GopsChecked(attached,FALSE);}
+/* A refusal must stay a refusal. This second, independent survey runs only after that
+   decision, so a pathless first GOP cannot hide later physical GOPs or framebuffer aliases.
+   It never participates in admission, runs at normal preflight TPL, and continues after
+   errors on individual handles. Device paths are bounded before LocateDevicePath. */
+static EFI_STATUS SurveyPathShape(const EFI_DEVICE_PATH_PROTOCOL *path,UINTN *bytes) {
+  *bytes=0;
+  for(UINTN i=0;i<128&&*bytes<=4092;i++) {
+    const EFI_DEVICE_PATH_PROTOCOL *node=(const VOID *)((const UINT8 *)path+*bytes);
+    UINTN length=node->Length[0]+((UINTN)node->Length[1]<<8);
+    if(length<4||length>4096-*bytes)return EFI_COMPROMISED_DATA;
+    *bytes+=length;
+    if(node->Type==END_DEVICE_PATH_TYPE)
+      return node->SubType==END_ENTIRE_DEVICE_PATH_SUBTYPE&&length==4?EFI_SUCCESS:EFI_UNSUPPORTED;
+  }
+  return EFI_COMPROMISED_DATA;
+}
+static VOID SurveyGopsAfterRefusal(VOID) {
+  EFI_HANDLE *handles=NULL;UINTN count=0;
+  EFI_STATUS s=Gu.bs->LocateHandleBuffer(ByProtocol,&GopGuid,NULL,&count,&handles);
+  NOTE("preflight GOP survey: admission_already_refused=1 enum_status=%#llx count=%zu buffer=%#llx\n",
+    (unsigned long long)s,(size_t)count,(unsigned long long)(UINTN)handles);
+  if(s!=EFI_SUCCESS||!handles||!count||count>128) {
+    NOTE("preflight GOP survey incomplete: enum_status=%#llx count=%zu max_handles=128\n",(unsigned long long)s,(size_t)count);
+    if(handles)Gu.bs->FreePool(handles);
+    return;
+  }
+  for(UINTN i=0;i<count;i++) {
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *g=NULL;EFI_DEVICE_PATH_PROTOCOL *path=NULL;EFI_HANDLE parent=NULL;
+    EFI_STATUS gs=Gu.bs->HandleProtocol(handles[i],&GopGuid,(VOID **)&g);
+    const EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *m=!EFI_ERROR(gs)&&g?g->Mode:NULL;
+    const EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info=m&&m->Info&&m->SizeOfInfo>=sizeof(*m->Info)?m->Info:NULL;
+    NOTE("preflight GOP survey[%u]: handle=%#llx protocol_status=%#llx protocol=%#llx console_out_handle=%u console_in_handle=%u console_err_handle=%u\n",
+      (unsigned)i,(unsigned long long)(UINTN)handles[i],(unsigned long long)gs,(unsigned long long)(UINTN)g,
+      handles[i]==Plan.console_out,handles[i]==Plan.console_in,handles[i]==Plan.console_err);
+    NOTE("preflight GOP survey[%u]: mode=%#llx info=%#llx info_bytes=%zu max_mode=%u mode_index=%u fb=%#llx fb_bytes=%#llx width=%u height=%u stride=%u format=%u screen=%u\n",
+      (unsigned)i,(unsigned long long)(UINTN)m,(unsigned long long)(UINTN)(m?m->Info:NULL),m?(size_t)m->SizeOfInfo:0,
+      m?m->MaxMode:0,m?m->Mode:0,(unsigned long long)(m?m->FrameBufferBase:0),(unsigned long long)(m?m->FrameBufferSize:0),
+      info?info->HorizontalResolution:0,info?info->VerticalResolution:0,info?info->PixelsPerScanLine:0,info?(unsigned)info->PixelFormat:0,
+      !EFI_ERROR(gs)&&g?Screen(g):FALSE);
+    EFI_STATUS ps=Gu.bs->HandleProtocol(handles[i],&PathGuid,(VOID **)&path);
+    UINTN bytes=0;EFI_STATUS shape=ps==EFI_SUCCESS&&path?SurveyPathShape(path,&bytes):EFI_NOT_FOUND;
+    EFI_STATUS parent_status=EFI_NOT_READY;BOOLEAN looked=FALSE;
+    if(shape==EFI_SUCCESS){EFI_DEVICE_PATH_PROTOCOL *left=path;looked=TRUE;parent_status=Gu.bs->LocateDevicePath(&PciGuid,&left,&parent);}
+    NOTE("preflight GOP survey[%u]: path_status=%#llx path=%#llx path_shape_status=%#llx path_bytes=%zu parent_lookup=%u parent_status=%#llx parent=%#llx target_handle=%#llx target_known=%u target=%u\n",
+      (unsigned)i,(unsigned long long)ps,(unsigned long long)(UINTN)path,(unsigned long long)shape,(size_t)bytes,looked,
+      (unsigned long long)parent_status,(unsigned long long)(UINTN)parent,(unsigned long long)(UINTN)Gu.handle,
+      looked&&!EFI_ERROR(parent_status),looked&&!EFI_ERROR(parent_status)&&parent==Gu.handle);
+  }
+  Gu.bs->FreePool(handles);
+  NOTE("preflight GOP survey complete: examined=%zu admission_still_refused=1\n",(size_t)count);
+}
+static EFI_STATUS AliveChecked(BOOLEAN log) {
   EFI_SYSTEM_TABLE *t=Plan.table;
-  if(t->ConsoleOutHandle!=Plan.console_out||t->ConsoleInHandle!=Plan.console_in||t->StandardErrorHandle!=Plan.console_err||
-     t->ConIn!=Plan.keys||t->ConOut!=Plan.text||t->StdErr!=Plan.err||!t->ConIn||(UINTN)t->ConIn->ReadKeyStroke!=Plan.key_read)
-    return EFI_NOT_READY;
-  return EFI_SUCCESS;
+  /* Decide with the original short-circuit expression before any diagnostic callback. */
+  BOOLEAN changed=t->ConsoleOutHandle!=Plan.console_out||t->ConsoleInHandle!=Plan.console_in||t->StandardErrorHandle!=Plan.console_err||
+    t->ConIn!=Plan.keys||t->ConOut!=Plan.text||t->StdErr!=Plan.err||!t->ConIn||(UINTN)t->ConIn->ReadKeyStroke!=Plan.key_read;
+  if(log){
+    BOOLEAN out=t->ConsoleOutHandle!=Plan.console_out,in=t->ConsoleInHandle!=Plan.console_in,err=t->StandardErrorHandle!=Plan.console_err;
+    BOOLEAN keys=t->ConIn!=Plan.keys,text=t->ConOut!=Plan.text,errtext=t->StdErr!=Plan.err;
+    UINTN key_read=t->ConIn?(UINTN)t->ConIn->ReadKeyStroke:0;
+    BOOLEAN read=!t->ConIn||key_read!=Plan.key_read;
+    NOTE("preflight console: changed=%u out_handle=%u in_handle=%u err_handle=%u keys=%u text=%u stderr=%u key_read=%u\n",changed,out,in,err,keys,text,errtext,read);
+    if(changed)NOTE("preflight console identities: out=%#llx/%#llx in=%#llx/%#llx err=%#llx/%#llx keys=%#llx/%#llx text=%#llx/%#llx stderr=%#llx/%#llx read=%#llx/%#llx (expected/current)\n",
+      (unsigned long long)(UINTN)Plan.console_out,(unsigned long long)(UINTN)t->ConsoleOutHandle,
+      (unsigned long long)(UINTN)Plan.console_in,(unsigned long long)(UINTN)t->ConsoleInHandle,
+      (unsigned long long)(UINTN)Plan.console_err,(unsigned long long)(UINTN)t->StandardErrorHandle,
+      (unsigned long long)(UINTN)Plan.keys,(unsigned long long)(UINTN)t->ConIn,
+      (unsigned long long)(UINTN)Plan.text,(unsigned long long)(UINTN)t->ConOut,
+      (unsigned long long)(UINTN)Plan.err,(unsigned long long)(UINTN)t->StdErr,
+      (unsigned long long)Plan.key_read,(unsigned long long)key_read);
+  }
+  return changed?EFI_NOT_READY:EFI_SUCCESS;
 }
+static EFI_STATUS Alive(VOID){return AliveChecked(FALSE);}
 static EFI_STATUS ReadConfig(UINT32 *c) {
   for(UINTN i=0;i<64;i++)if(EFI_ERROR(GuConfigRead(EfiPciIoWidthUint32,(UINT32)i*4,&c[i])))return EFI_DEVICE_ERROR;
   return EFI_SUCCESS;
@@ -283,6 +514,9 @@ EFI_STATUS GuRelPreflight(EFI_SYSTEM_TABLE *t,EFI_HANDLE self,EFI_HANDLE pci) {
   Plan.text=t->ConOut;Plan.err=t->StdErr;Plan.keys=t->ConIn;
   if(!Plan.console_out||!Plan.console_in||!Plan.console_err||!Plan.text||!Plan.err||!Plan.keys||!Plan.keys->ReadKeyStroke)return EFI_UNSUPPORTED;
   Plan.key_read=(UINTN)Plan.keys->ReadKeyStroke;
+  NOTE("preflight console snapshot: out_handle=%#llx in_handle=%#llx err_handle=%#llx keys=%#llx text=%#llx stderr=%#llx read=%#llx\n",
+    (unsigned long long)(UINTN)Plan.console_out,(unsigned long long)(UINTN)Plan.console_in,(unsigned long long)(UINTN)Plan.console_err,
+    (unsigned long long)(UINTN)Plan.keys,(unsigned long long)(UINTN)Plan.text,(unsigned long long)(UINTN)Plan.err,(unsigned long long)Plan.key_read);
   UINTN seg,bus,dev,fun;EFI_STATUS s=Gu.pci->GetLocation(Gu.pci,&seg,&bus,&dev,&fun);
   if(s==EFI_SUCCESS)s=ReadConfig(Plan.config);
   if(s==EFI_SUCCESS&&!GuTargetConfig(Plan.config,seg,bus,dev,fun))s=EFI_UNSUPPORTED;
@@ -309,8 +543,11 @@ EFI_STATUS GuRelPreflight(EFI_SYSTEM_TABLE *t,EFI_HANDLE self,EFI_HANDLE pci) {
   if(s==EFI_SUCCESS&&!(Plan.attributes&EFI_PCI_IO_ATTRIBUTE_MEMORY))s=EFI_NOT_READY;
   if(s==EFI_SUCCESS)s=Bar();
   if(s==EFI_SUCCESS)s=FindOwner(&Plan.owner,TRUE);
-  if(s==EFI_SUCCESS&&!Gops(TRUE))s=EFI_NOT_READY;
-  if(s==EFI_SUCCESS&&Alive()!=EFI_SUCCESS)s=EFI_NOT_READY;
+  if(s==EFI_SUCCESS&&!GopsChecked(TRUE,TRUE)){
+    s=EFI_NOT_READY; /* fixed before the independent survey: its results cannot admit the card */
+    SurveyGopsAfterRefusal();
+  }
+  if(s==EFI_SUCCESS&&AliveChecked(TRUE)!=EFI_SUCCESS)s=EFI_NOT_READY;
   if(s==EFI_SUCCESS)NOTE("release preflight: slot=%zu:%zu:%zu.%zu bar0=%#llx attributes=%#llx driver=%u display_children=%zu bme_entry=%u\n",
     seg,bus,dev,fun,(unsigned long long)Gu.bar_base,(unsigned long long)Plan.attributes,Plan.owner.agent!=NULL,(size_t)Plan.owner.child_count,Plan.bme_entry);
   for(UINTN i=0;s==EFI_SUCCESS&&i<Plan.owner.child_count;i++){
